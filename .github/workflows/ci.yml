@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [ 'v3.8.9-est', 'ci/github-actions' ]
+  pull_request:
+    branches: [ 'v3.8.9-est' ]
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        otp: [ '21.3', '22.2' ]
+
+    env:
+      base_rmq_ref: v3.8.x
+      current_rmq_ref: v3.8.9-est
+      PLUGIN: rabbitmq_federation_management
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build CI image
+        run: |
+          docker build \
+            --build-arg OTP_VERSION="${{ matrix.otp }}" \
+            --tag "rabbitmq-ci:otp-${{ matrix.otp }}" \
+            .
+
+      - name: Run checks
+        run: |
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
+            --workdir "$GITHUB_WORKSPACE" \
+            --hostname rabbitmq-ci \
+            --env base_rmq_ref \
+            --env current_rmq_ref \
+            --env PLUGIN \
+            "rabbitmq-ci:otp-${{ matrix.otp }}" \
+            bash -euo pipefail -c '
+              # The git_rmq macro uses an SSH push URL for components; the CI
+              # image has no ssh binary, so rewrite github SSH URLs to HTTPS.
+              # This plugin fetches rabbit, whose recursive dep fetch would
+              # otherwise invoke ssh.
+              git config --global url."https://github.com/".insteadOf git@github.com:
+              git config --global --add safe.directory "*"
+              # Build the plugin inside an umbrella checkout so rabbit and the
+              # other components are flat sibling applications and rabbit builds
+              # before rabbitmq_federation. A standalone plugin build fetches
+              # rabbit, which re-expands its own umbrella and compiles
+              # rabbitmq_federation before the amqqueue.hrl app of rabbit is
+              # built.
+              WS="$(pwd)"
+              cd /tmp
+              git clone --depth 1 --branch "$base_rmq_ref" \
+                https://github.com/rabbitmq/rabbitmq-public-umbrella.git umbrella
+              mkdir -p umbrella/deps
+              cp -a "$WS" "umbrella/deps/$PLUGIN"
+              cd "umbrella/deps/$PLUGIN"
+              make xref current_rmq_ref="$current_rmq_ref"
+              epmd -daemon
+              # federation_mgmt_SUITE is the only suite of this plugin (3 federation
+              # integration cases). It is small enough to pass under the hosted
+              # runner, verified at 4 cores. The backport is pin-only (no
+              # first-party code change), so build + xref + this suite is the
+              # full guard.
+              make tests current_rmq_ref="$current_rmq_ref"
+            '
